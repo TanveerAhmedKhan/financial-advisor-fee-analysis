@@ -1,0 +1,8 @@
+# Ignore all files in the data directory
+data/
+
+# Ignore Python virtual environment
+.venv/
+
+# Ignore Git directory (not necessary, Git ignores this by default)
+# .git
