@@ -364,6 +364,12 @@ def process_csv_file(file_path, output_dir):
                         pct_value = float(pct_match.group(1)) / 100
                         return pct_value, pct_value, is_range, col_idx
 
+                    # NEW: Check for "X% or less" patterns within parentheses
+                    or_less_match = re.search(r'\(([\d\.]+)%\s+or\s+less\)', original_str, re.IGNORECASE)
+                    if or_less_match:
+                        pct_value = float(or_less_match.group(1)) / 100
+                        return pct_value, pct_value, is_range, col_idx
+
                     # Third priority: Check for percentage range NOT in parentheses (like "0.32% - 2.50%")
                     range_no_parens = re.search(r'([\d\.]+)% ?- ?([\d\.]+)%', original_str)
                     if range_no_parens:
@@ -389,13 +395,28 @@ def process_csv_file(file_path, output_dir):
                 df[f'Fee_Is_Range_{i}'] = [val[2] for val in fee_info_values]
                 # We're not storing Fee_Source anymore
 
-                # Extract threshold range - enhanced approach with "Under" pattern support
+                # Extract threshold range - enhanced approach with "Under" pattern support and foreign currency handling
                 def extract_threshold_range(threshold_str):
                     # Improved handling of empty or invalid cells
                     if pd.isna(threshold_str) or threshold_str == 'N/a' or threshold_str == 'N/A' or threshold_str == '-1' or str(threshold_str).strip() == '':
-                        return np.nan, np.nan
+                        return np.nan, np.nan, "USD"
 
                     original_str = str(threshold_str)
+                    currency = "USD"  # Default currency
+
+                    # First, detect currency from the string
+                    foreign_currency_patterns = [
+                        (r'CHF', 'CHF'),
+                        (r'EUR', 'EUR'),
+                        (r'GBP', 'GBP'),
+                        (r'£', 'GBP'),
+                        (r'€', 'EUR')
+                    ]
+
+                    for pattern, curr in foreign_currency_patterns:
+                        if re.search(pattern, original_str, re.IGNORECASE):
+                            currency = curr
+                            break
 
                     # Helper function to parse currency amounts with various formats
                     def parse_currency_amount(amount_str):
@@ -446,9 +467,51 @@ def process_csv_file(file_path, output_dir):
                             upper_amount = parse_currency_amount(amount_str)
                             if upper_amount is not None:
                                 # "Under $X" becomes "$0 - $X"
-                                return 0, upper_amount
+                                return 0, upper_amount, currency
 
-                    # Extract dollar range
+                    # NEW: Extract foreign currency ranges
+                    # Patterns like "0 - 100,000,000 EUR", "1,000 - 5,000 CHF", "€0 - €1M"
+                    foreign_range_patterns = [
+                        (r'(\d+(?:,\d+)*(?:\.\d+)?)\s*-\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*EUR', 'EUR'),
+                        (r'(\d+(?:,\d+)*(?:\.\d+)?)\s*-\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*CHF', 'CHF'),
+                        (r'(\d+(?:,\d+)*(?:\.\d+)?)\s*-\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*GBP', 'GBP'),
+                        (r'€(\d+(?:,\d+)*(?:\.\d+)?)\s*-\s*€(\d+(?:,\d+)*(?:\.\d+)?)', 'EUR'),
+                        (r'£(\d+(?:,\d+)*(?:\.\d+)?)\s*-\s*£(\d+(?:,\d+)*(?:\.\d+)?)', 'GBP'),
+                    ]
+
+                    for pattern, curr in foreign_range_patterns:
+                        range_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if range_match:
+                            lower_str = range_match.group(1).replace(',', '')
+                            upper_str = range_match.group(2).replace(',', '')
+                            try:
+                                lower = float(lower_str)
+                                upper = float(upper_str)
+                                return lower, upper, curr
+                            except ValueError:
+                                continue
+
+                    # Extract dollar range - enhanced to handle million notation
+                    # Pattern 1: Handle million notation ranges like "$1.5 million - $3 million"
+                    million_range_match = re.search(r'\$(\d+(?:\.\d+)?)\s*million\s*-\s*\$(\d+(?:\.\d+)?)\s*million', original_str, re.IGNORECASE)
+                    if million_range_match:
+                        lower_num = float(million_range_match.group(1))
+                        upper_num = float(million_range_match.group(2))
+                        lower = lower_num * 1000000
+                        upper = upper_num * 1000000
+                        return lower, upper, currency
+
+                    # Pattern 2: Handle mixed ranges like "$750,001 - $1.5 million" or "$500K - $1.5 million"
+                    mixed_range_match = re.search(r'\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)\s*-\s*\$(\d+(?:\.\d+)?)\s*million', original_str, re.IGNORECASE)
+                    if mixed_range_match:
+                        lower_str = mixed_range_match.group(1)
+                        upper_num = float(mixed_range_match.group(2))
+                        lower = parse_currency_amount(lower_str)  # Use parse function to handle K/M/B
+                        upper = upper_num * 1000000
+                        if lower is not None:
+                            return lower, upper, currency
+
+                    # Pattern 3: Standard dollar range (existing logic)
                     range_match = re.search(r'\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?) - \$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)', original_str, re.IGNORECASE)
                     if range_match:
                         lower_str = range_match.group(1)
@@ -456,9 +519,90 @@ def process_csv_file(file_path, output_dir):
                         lower = parse_currency_amount(lower_str)
                         upper = parse_currency_amount(upper_str)
                         if lower is not None and upper is not None:
-                            return lower, upper
+                            return lower, upper, currency
 
-                    # Extract lower bound with plus
+                    # NEW: Extract "below/less than/under" patterns - convert to $0 - $X ranges
+                    # Pattern 1: Handle "below/less than/under $X million" patterns
+                    below_million_patterns = [
+                        r'below\s+\$(\d+(?:\.\d+)?)\s*million',
+                        r'less\s+than\s+\$(\d+(?:\.\d+)?)\s*million',
+                        r'under\s+\$(\d+(?:\.\d+)?)\s*million'
+                    ]
+
+                    for pattern in below_million_patterns:
+                        below_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if below_match:
+                            upper_num = float(below_match.group(1))
+                            upper = upper_num * 1000000
+                            return 0.0, upper, currency
+
+                    # Pattern 2: Handle "below/less than/under X million" patterns (no dollar sign)
+                    below_million_no_dollar_patterns = [
+                        r'below\s+(\d+(?:\.\d+)?)\s*million',
+                        r'less\s+than\s+(\d+(?:\.\d+)?)\s*million',
+                        r'under\s+(\d+(?:\.\d+)?)\s*million'
+                    ]
+
+                    for pattern in below_million_no_dollar_patterns:
+                        below_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if below_match:
+                            upper_num = float(below_match.group(1))
+                            upper = upper_num * 1000000
+                            return 0.0, upper, currency
+
+                    # Pattern 3: Handle "below/less than/under $X" patterns (with K/M/B suffixes)
+                    below_dollar_patterns = [
+                        r'below\s+\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)',
+                        r'less\s+than\s+\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)',
+                        r'under\s+\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)'
+                    ]
+
+                    for pattern in below_dollar_patterns:
+                        below_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if below_match:
+                            amount_str = below_match.group(1)
+                            upper = parse_currency_amount(amount_str)
+                            if upper is not None:
+                                return 0.0, upper, currency
+
+                    # Pattern 4: Handle "below/less than/under X" patterns (no dollar sign, with K/M/B suffixes)
+                    below_no_dollar_patterns = [
+                        r'below\s+(\d+(?:,\d+)*(?:\.\d+)?[kmb])',
+                        r'less\s+than\s+(\d+(?:,\d+)*(?:\.\d+)?[kmb])',
+                        r'under\s+(\d+(?:,\d+)*(?:\.\d+)?[kmb])'
+                    ]
+
+                    for pattern in below_no_dollar_patterns:
+                        below_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if below_match:
+                            amount_str = below_match.group(1)
+                            upper = parse_currency_amount(amount_str)
+                            if upper is not None:
+                                return 0.0, upper, currency
+
+                    # Extract lower bound with plus - enhanced to handle million notation
+                    # Pattern 1: Handle million notation plus like "$5 million+"
+                    million_plus_match = re.search(r'\$(\d+(?:\.\d+)?)\s*million\+', original_str, re.IGNORECASE)
+                    if million_plus_match:
+                        lower_num = float(million_plus_match.group(1))
+                        lower = lower_num * 1000000
+                        return lower, np.inf, currency
+
+                    # NEW: Handle "over/above $X million" patterns - convert to $X million+
+                    over_million_patterns = [
+                        r'over\s+\$(\d+(?:\.\d+)?)\s*million',
+                        r'above\s+\$(\d+(?:\.\d+)?)\s*million',
+                        r'more\s+than\s+\$(\d+(?:\.\d+)?)\s*million'
+                    ]
+
+                    for pattern in over_million_patterns:
+                        over_match = re.search(pattern, original_str, re.IGNORECASE)
+                        if over_match:
+                            lower_num = float(over_match.group(1))
+                            lower = lower_num * 1000000
+                            return lower, np.inf, currency
+
+                    # Pattern 2: Standard plus patterns (existing logic)
                     plus_patterns = [
                         r'\$(\d+(?:,\d+)*(?:\.\d+)?[kmb]?)\+',  # "$500K+", "$0.5M+"
                         r'\$(\d+(?:,\d+)*(?:\.\d+)?)\+',        # "$500,000+"
@@ -470,7 +614,7 @@ def process_csv_file(file_path, output_dir):
                             amount_str = plus_match.group(1)
                             lower = parse_currency_amount(amount_str)
                             if lower is not None:
-                                return lower, np.inf
+                                return lower, np.inf, currency
 
                     # Extract upper bound with less than
                     upper_patterns = [
@@ -484,7 +628,7 @@ def process_csv_file(file_path, output_dir):
                             amount_str = upper_match.group(1)
                             upper = parse_currency_amount(amount_str)
                             if upper is not None:
-                                return 0, upper
+                                return 0, upper, currency
 
                     # Extract single dollar amount
                     single_patterns = [
@@ -498,14 +642,15 @@ def process_csv_file(file_path, output_dir):
                             amount_str = single_match.group(1)
                             amount = parse_currency_amount(amount_str)
                             if amount is not None:
-                                return amount, amount
+                                return amount, amount, currency
 
-                    return np.nan, np.nan
+                    return np.nan, np.nan, currency
 
-                # Initialize threshold columns with NaN values
-                df[f'Threshold_Lower_{i}'], df[f'Threshold_Upper_{i}'] = zip(
-                    *df[col_name].apply(extract_threshold_range)
-                )
+                # Initialize threshold columns with NaN values and extract currency information
+                threshold_results = df[col_name].apply(extract_threshold_range)
+                df[f'Threshold_Lower_{i}'] = [result[0] for result in threshold_results]
+                df[f'Threshold_Upper_{i}'] = [result[1] for result in threshold_results]
+                df[f'Threshold_Currency_{i}'] = [result[2] for result in threshold_results]
 
                 # Special handling: If we have fee percentages but no threshold information,
                 # default to $0+ (i.e., Threshold_Lower = 0.0, Threshold_Upper = inf)
@@ -741,6 +886,15 @@ def process_csv_file(file_path, output_dir):
                     single_pct_match = re.search(r'\(([\d\.]+)%\)', threshold_str)
                     if single_pct_match:
                         pct_value = float(single_pct_match.group(1)) / 100
+                        row[f'Fee_Pct_Min_{i}'] = pct_value
+                        row[f'Fee_Pct_Max_{i}'] = pct_value
+                        row[f'Fee_Is_Range_{i}'] = False
+                        continue  # Skip other checks for this tier
+
+                    # NEW: Check for "X% or less" patterns in parentheses: (X% or less)
+                    or_less_match = re.search(r'\(([\d\.]+)%\s+or\s+less\)', threshold_str, re.IGNORECASE)
+                    if or_less_match:
+                        pct_value = float(or_less_match.group(1)) / 100
                         row[f'Fee_Pct_Min_{i}'] = pct_value
                         row[f'Fee_Pct_Max_{i}'] = pct_value
                         row[f'Fee_Is_Range_{i}'] = False

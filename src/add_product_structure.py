@@ -36,8 +36,8 @@ PROCESSED_DATA_DIR = os.path.join('data', 'processed')
 INPUT_FILE = 'cleaned_fee_data_ordered.csv'
 OUTPUT_FILE = 'cleaned_fee_data_with_products.csv'
 
-def format_threshold(value):
-    """Format threshold values in a human-readable way."""
+def format_threshold(value, currency="USD"):
+    """Format threshold values in a human-readable way with proper currency symbol."""
     if pd.isna(value) or value is None:
         return ""
 
@@ -51,15 +51,36 @@ def format_threshold(value):
         except ValueError:
             return value  # Return as is if conversion fails
 
-    # Format large numbers with K, M, B suffixes
-    if value >= 1_000_000_000:
-        return f"${value/1_000_000_000:.1f}B"
-    elif value >= 1_000_000:
-        return f"${value/1_000_000:.1f}M"
-    elif value >= 1_000:
-        return f"${value/1_000:.0f}K"
+    # Get currency symbol
+    currency_symbols = {
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "CHF": "CHF "  # CHF typically goes before the number
+    }
+
+    symbol = currency_symbols.get(currency, "$")  # Default to USD symbol
+
+    # For CHF, format differently (symbol before number)
+    if currency == "CHF":
+        if value >= 1_000_000_000:
+            return f"CHF {value/1_000_000_000:.1f}B"
+        elif value >= 1_000_000:
+            return f"CHF {value/1_000_000:.1f}M"
+        elif value >= 1_000:
+            return f"CHF {value/1_000:.0f}K"
+        else:
+            return f"CHF {value:.0f}"
     else:
-        return f"${value:.0f}"
+        # For other currencies (USD, EUR, GBP), symbol goes before number
+        if value >= 1_000_000_000:
+            return f"{symbol}{value/1_000_000_000:.1f}B"
+        elif value >= 1_000_000:
+            return f"{symbol}{value/1_000_000:.1f}M"
+        elif value >= 1_000:
+            return f"{symbol}{value/1_000:.0f}K"
+        else:
+            return f"{symbol}{value:.0f}"
 
 def format_percentage(value):
     """Format percentage values in a human-readable way."""
@@ -76,7 +97,11 @@ def format_percentage(value):
             return value  # Return as is if conversion fails
 
     # Convert from decimal to percentage and format
-    return f"{value*100:.2f}%".rstrip('0').rstrip('.') + '%'
+    formatted = f"{value*100:.2f}%".rstrip('0').rstrip('.')
+    # Ensure we don't remove the % sign when stripping
+    if not formatted.endswith('%'):
+        formatted += '%'
+    return formatted
 
 def identify_products(row):
     """
@@ -146,6 +171,100 @@ def identify_products(row):
     logging.debug("All phases failed to extract valid products")
     return []
 
+def fix_threshold_scaling_issues(tiers):
+    """
+    Fix threshold scaling issues where values are incorrectly scaled.
+
+    This addresses cases where threshold lower bounds are scaled incorrectly,
+    such as 15.0 instead of 15,000,000.0.
+
+    Args:
+        tiers: List of tier dictionaries
+
+    Returns:
+        List of fixed tier dictionaries
+    """
+    fixed_tiers = []
+
+    for tier in tiers:
+        fixed_tier = tier.copy()
+
+        # Check for scaling issues
+        # If a tier has a very small lower bound compared to the upper bound,
+        # it might be a scaling issue
+        if (pd.notna(tier['lower']) and pd.notna(tier['upper']) and
+            tier['lower'] > 0 and tier['upper'] > tier['lower'] * 1000000):
+
+            # Check if this looks like a million-scale issue
+            # E.g., lower=15.0, upper=30000000.0 should be lower=15000000.0
+            if tier['lower'] < 1000 and tier['upper'] > 1000000:
+                # Scale up the lower bound
+                fixed_tier['lower'] = tier['lower'] * 1000000
+                logging.debug(f"Fixed scaling: Tier {tier['index']} lower {tier['lower']} -> {fixed_tier['lower']}")
+
+        fixed_tiers.append(fixed_tier)
+
+    return fixed_tiers
+
+def align_fees_with_thresholds(tiers):
+    """
+    Align fee data with threshold data, handling missing fees and tier misalignment.
+
+    This addresses cases where fee data starts from a different tier than threshold data,
+    causing misalignment in product generation.
+
+    Args:
+        tiers: List of tier dictionaries
+
+    Returns:
+        List of aligned tier dictionaries
+    """
+    if not tiers:
+        return tiers
+
+    # Separate tiers with thresholds and tiers with fees
+    threshold_tiers = [t for t in tiers if pd.notna(t['lower']) or pd.notna(t['upper'])]
+    fee_tiers = [t for t in tiers if pd.notna(t['fee_min']) or pd.notna(t['fee_max'])]
+
+    if not threshold_tiers or not fee_tiers:
+        return tiers
+
+    # Sort both by index
+    threshold_tiers.sort(key=lambda x: x['index'])
+    fee_tiers.sort(key=lambda x: x['index'])
+
+    # Create aligned tiers
+    aligned_tiers = []
+
+    # Try to align fees with thresholds
+    for i, thresh_tier in enumerate(threshold_tiers):
+        aligned_tier = thresh_tier.copy()
+
+        # Try to find matching fee tier
+        matching_fee = None
+
+        # First, try exact index match
+        for fee_tier in fee_tiers:
+            if fee_tier['index'] == thresh_tier['index']:
+                matching_fee = fee_tier
+                break
+
+        # If no exact match, try sequential alignment
+        # This handles cases where fees start from a different tier
+        if matching_fee is None and i < len(fee_tiers):
+            matching_fee = fee_tiers[i]
+            logging.debug(f"Aligned fee tier {matching_fee['index']} with threshold tier {thresh_tier['index']}")
+
+        # Apply fee data if found
+        if matching_fee:
+            aligned_tier['fee_min'] = matching_fee['fee_min']
+            aligned_tier['fee_max'] = matching_fee['fee_max']
+            aligned_tier['is_range'] = matching_fee['is_range']
+
+        aligned_tiers.append(aligned_tier)
+
+    return aligned_tiers
+
 def collect_tiers(row):
     """
     Collect all threshold tiers from the row data.
@@ -165,6 +284,7 @@ def collect_tiers(row):
     for i in range(1, 9):
         threshold_lower = row.get(f'Threshold_Lower_{i}')
         threshold_upper = row.get(f'Threshold_Upper_{i}')
+        threshold_currency = row.get(f'Threshold_Currency_{i}', 'USD')  # Default to USD if not present
         fee_min = row.get(f'Fee_Pct_Min_{i}')
         fee_max = row.get(f'Fee_Pct_Max_{i}')
         is_range = row.get(f'Fee_Is_Range_{i}')
@@ -180,10 +300,15 @@ def collect_tiers(row):
             'index': i,
             'lower': threshold_lower,
             'upper': threshold_upper,
+            'currency': threshold_currency,
             'fee_min': fee_min,
             'fee_max': fee_max,
             'is_range': is_range
         })
+
+    # Apply threshold scaling fix and fee alignment
+    tiers = fix_threshold_scaling_issues(tiers)
+    tiers = align_fees_with_thresholds(tiers)
 
     return tiers
 
@@ -856,17 +981,22 @@ def format_product(product):
     # Format thresholds with ranges
     threshold_ranges = []
     for i, lower in enumerate(product["thresholds"]):
+        # Get currency for this threshold (default to USD if not available)
+        currency = "USD"
+        if "currencies" in product and i < len(product["currencies"]):
+            currency = product["currencies"][i] or "USD"
+
         if "upper_bounds" in product and i < len(product["upper_bounds"]):
             upper = product["upper_bounds"][i]
 
             # Format the threshold range
             if upper == np.inf:
-                threshold_ranges.append(f"{format_threshold(lower)}+")
+                threshold_ranges.append(f"{format_threshold(lower, currency)}+")
             else:
-                threshold_ranges.append(f"{format_threshold(lower)}-{format_threshold(upper)}")
+                threshold_ranges.append(f"{format_threshold(lower, currency)}-{format_threshold(upper, currency)}")
         else:
             # Fallback if upper bounds are not available
-            threshold_ranges.append(format_threshold(lower))
+            threshold_ranges.append(format_threshold(lower, currency))
 
     thresholds_str = ", ".join(threshold_ranges)
 
