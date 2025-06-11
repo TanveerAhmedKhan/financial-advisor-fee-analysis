@@ -6,3 +6,6 @@ data/
 
 # Ignore Git directory (not necessary, Git ignores this by default)
 # .git
+
+
+src/__pycache__/
